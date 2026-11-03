@@ -18,9 +18,12 @@ Implements:
    and baseline, providing plain-language "Why this result?" factor explanations.
 """
 
+import os
+from functools import lru_cache
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
-from services.field_context import FieldContext
+import pandas as pd
+from services.field_context import FieldContext, ENCODED_COLUMNS
 
 try:
     from services.management_engine import safe_float, safe_int
@@ -364,6 +367,94 @@ def calculate_practical_agronomic_optimum(
 # 3. 5-SCENARIO WHAT-IF DECISION SIMULATOR
 # ============================================================================
 
+# ============================================================================
+# MODEL-DERIVED ATTRIBUTION & UNCERTAINTY (computed from the deployed model)
+# ============================================================================
+
+_TRIALS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "field_trials.csv")
+SOIL_FEATURES = ["soil_organic_carbon", "soil_ph", "nitrogen_kgha", "phosphorus_kgha", "potassium_kgha",
+                 "clay_content_pct", "sulphur_ppm", "zinc_ppm", "boron_ppm"]
+WEATHER_FEATURES = ["cumulative_rainfall_mm", "growing_degree_days", "avg_temperature_c",
+                    "heat_stress_days", "peak_ndvi"]
+_ERROR_BAND_CACHE: Dict[Tuple[int, str], float] = {}
+
+
+@lru_cache(maxsize=1)
+def _load_trials() -> Optional[pd.DataFrame]:
+    try:
+        return pd.read_csv(_TRIALS_CSV)
+    except Exception:
+        return None
+
+
+def _crop_reference(crop: str) -> Optional[Dict[str, float]]:
+    """Mean soil and weather inputs of this crop's training trials: the 'typical field' baseline."""
+    df = _load_trials()
+    if df is None or crop not in set(df["crop"]):
+        return None
+    return df.loc[df["crop"] == crop, SOIL_FEATURES + WEATHER_FEATURES].mean().to_dict()
+
+
+def crop_error_band(model: Any, crop: str, fallback: float = 3.99) -> float:
+    """90th-percentile absolute error (q/acre) of the model on this crop's held-out 2025 trials."""
+    key = (id(model), crop)
+    if key in _ERROR_BAND_CACHE:
+        return _ERROR_BAND_CACHE[key]
+    band = fallback
+    df = _load_trials()
+    if df is not None:
+        test = df[(df["year"] == 2025) & (df["crop"] == crop)]
+        if len(test) >= 5:
+            enc = pd.get_dummies(test, columns=["crop_type", "region"])
+            x = enc.reindex(columns=ENCODED_COLUMNS, fill_value=0).astype(float)
+            try:
+                resid = np.abs(test["yield"].values - model.predict(x))
+                band = float(np.quantile(resid, 0.9))
+            except Exception:
+                band = fallback
+    _ERROR_BAND_CACHE[key] = round(band, 2)
+    return _ERROR_BAND_CACHE[key]
+
+
+def decompose_yield(field_ctx: FieldContext, model: Any) -> Dict[str, Any]:
+    """
+    Sequential counterfactual decomposition of the current prediction:
+      base    = typical soil and weather for this crop and region, untreated
+      soil    = effect of this field's soil (weather held typical)
+      weather = effect of this season's weather (with this field's soil)
+      bio     = treated minus untreated, identical to the scenario engine's lift
+    The parts add up exactly to the prediction. Interactions make the split order-dependent, so this
+    explains the model's prediction; it is not an independent causal estimate.
+    """
+    x_untreated = field_ctx.to_feature_dataframe(bio_applied_override=False)
+    y_untreated = safe_float(model.predict(x_untreated)[0], 0.0)
+    y_treated = safe_float(model.predict(field_ctx.to_feature_dataframe(bio_applied_override=True))[0], 0.0)
+    bio = (y_treated - y_untreated) if field_ctx.bio_applied else 0.0
+
+    ref = _crop_reference(field_ctx.proxy_crop)
+    if ref is None:
+        return {"base_q_acre": round(y_untreated, 2), "soil_q_acre": 0.0, "weather_q_acre": 0.0,
+                "bio_q_acre": round(bio, 2), "total_q_acre": round(y_untreated + bio, 2),
+                "method": "Treated vs. untreated contrast only (training reference unavailable)"}
+
+    x_soil = x_untreated.copy()
+    for c in WEATHER_FEATURES:
+        x_soil[c] = ref[c]
+    x_base = x_soil.copy()
+    for c in SOIL_FEATURES:
+        x_base[c] = ref[c]
+    y_soil = safe_float(model.predict(x_soil)[0], y_untreated)
+    y_base = safe_float(model.predict(x_base)[0], y_untreated)
+    return {
+        "base_q_acre": round(y_base, 2),
+        "soil_q_acre": round(y_soil - y_base, 2),
+        "weather_q_acre": round(y_untreated - y_soil, 2),
+        "bio_q_acre": round(bio, 2),
+        "total_q_acre": round(y_untreated + bio, 2),
+        "method": "Sequential counterfactual decomposition of the yield model (base → soil → weather → biological)",
+    }
+
+
 def simulate_5_scenarios(
     field_ctx: FieldContext,
     model: Any,
@@ -384,7 +475,9 @@ def simulate_5_scenarios(
     fert_ratio = fertilizer_ratio_override if fertilizer_ratio_override is not None else 1.0
 
     crop_price = field_ctx.crop_price
-    bio_cost = field_ctx.product_cost_per_ha
+    # Revenue below is per acre, so the biological cost must be per acre and follow the chosen dose
+    bio_cost = field_ctx.product_cost_per_acre(bio_dose)
+    best_bio_cost = field_ctx.product_cost_per_acre(field_ctx.recommended_bio_dose)
     fert_cost_kg = field_ctx.fertilizer_cost_per_kg
     crop = field_ctx.proxy_crop
     bio_pot = BIOLOGICAL_POTENTIAL_CEILINGS_Q_ACRE.get(crop, 32.0)
@@ -411,7 +504,7 @@ def simulate_5_scenarios(
         nitrogen_override=field_ctx.nitrogen * 1.08,
         temp_override=min(field_ctx.temp_c, 30.0) # Buffered thermal profile from microclimate
     )
-    y_bio_mgt = min(safe_float(model.predict(df_bio_mgt)[0], 26.0) * 1.03, mgt_ceiling)
+    y_bio_mgt = min(safe_float(model.predict(df_bio_mgt)[0], 26.0), mgt_ceiling)
 
     # SCENARIO 4: OPTIMIZED FERTILIZER (SHC Balanced NPK + Current Biological)
     df_opt_fert = field_ctx.to_feature_dataframe(
@@ -432,7 +525,8 @@ def simulate_5_scenarios(
         potassium_override=icar_rec["K"],
         temp_override=min(field_ctx.temp_c, 30.0)
     )
-    y_best = min(safe_float(model.predict(df_best)[0], 30.0) * 1.04, mgt_ceiling)
+    y_best = min(safe_float(model.predict(df_best)[0], 30.0), mgt_ceiling)
+    band = crop_error_band(model, crop)
 
     # Helper to calculate financial metrics
     def calc_metrics(y_val, has_bio, bio_cost_val, n_applied, p_applied, k_applied, label, desc):
@@ -451,8 +545,9 @@ def simulate_5_scenarios(
             "scenario": label,
             "description": desc,
             "expected_yield_q_acre": round(y_val, 2),
-            "yield_lower_bound": round(max(0.0, y_val - 3.99), 2),
-            "yield_upper_bound": round(y_val + 3.99, 2),
+            "yield_lower_bound": round(max(0.0, y_val - band), 2),
+            "yield_upper_bound": round(y_val + band, 2),
+            "error_band_q_acre": band,
             "incremental_yield_q_acre": round(inc_y, 2),
             "gross_revenue_inr": round(gross_rev, 2),
             "biological_cost_inr": round(bio_cost_val if has_bio else 0.0, 2),
@@ -507,7 +602,7 @@ def simulate_5_scenarios(
         calc_metrics(
             y_best,
             True,
-            bio_cost,
+            best_bio_cost,
             icar_rec["N"],
             icar_rec["P"],
             icar_rec["K"],
@@ -516,20 +611,10 @@ def simulate_5_scenarios(
         )
     ]
 
-    # Attribution breakdown of Current Practice
-    bio_effect = max(0.0, y_current - y_untreated)
-    base_soil_potential = max(0.0, y_untreated * 0.65)
-    env_weather_effect = max(0.0, y_untreated * 0.35)
-    total_y = max(0.1, y_current)
-
-    attribution = {
-        "baseline_soil_contribution_pct": round((base_soil_potential / total_y) * 100.0, 1),
-        "weather_climate_contribution_pct": round((env_weather_effect / total_y) * 100.0, 1),
-        "biological_treatment_contribution_pct": round((bio_effect / total_y) * 100.0, 1),
-        "pure_biological_tau_q_acre": round(bio_effect, 2),
-        "counterfactual_untreated_yield_q_acre": round(y_untreated, 2),
-        "current_treated_yield_q_acre": round(y_current, 2)
-    }
+    # Attribution breakdown of Current Practice, derived from the model (not fixed ratios)
+    attribution = decompose_yield(field_ctx, model)
+    attribution["counterfactual_untreated_yield_q_acre"] = round(y_untreated, 2)
+    attribution["current_treated_yield_q_acre"] = round(y_current, 2)
 
     return {
         "scenarios": scenarios,
@@ -550,14 +635,16 @@ def explain_attribution(field_ctx: FieldContext, model: Any, explainer: Any = No
     agronomic factors, their direction of influence, and source provenance.
     """
     factors = []
+    parts = decompose_yield(field_ctx, model)
+    fmt = lambda v: f"{v:+.2f} q/acre"
 
     # 1. Biological Priming Factor
     if field_ctx.bio_applied:
         factors.append({
             "name": f"Biological Treatment ({field_ctx.bio_product})",
-            "direction": "POSITIVE",
-            "arrow": "🟢 ▲",
-            "impact_q_acre": "+2.1 to +4.5 q/acre",
+            "direction": "POSITIVE" if parts["bio_q_acre"] > 0 else "NO MEASURABLE EFFECT",
+            "arrow": "🟢 ▲" if parts["bio_q_acre"] > 0 else "⚪ ━",
+            "impact_q_acre": fmt(parts["bio_q_acre"]),
             "explanation": "Active root priming and osmoprotection against abiotic stress.",
             "provenance": "Causal Counterfactual Contrast (Treated vs. Control)"
         })
@@ -572,12 +659,12 @@ def explain_attribution(field_ctx: FieldContext, model: Any, explainer: Any = No
         })
 
     # 2. Soil Health (SOC & pH)
-    if field_ctx.soc >= 0.50 and 6.5 <= field_ctx.ph <= 7.8:
+    if parts["soil_q_acre"] >= 0:
         factors.append({
             "name": f"Soil Chemical Balance (pH {field_ctx.ph:.1f}, OC {field_ctx.soc*10:.1f} g/kg)",
             "direction": "POSITIVE",
             "arrow": "🟢 ▲",
-            "impact_q_acre": "+1.8 q/acre",
+            "impact_q_acre": fmt(parts["soil_q_acre"]),
             "explanation": "Rhizosphere conditions maximize nutrient availability.",
             "provenance": "Govt Soil Health Card (DAC&FW Standards)"
         })
@@ -586,19 +673,19 @@ def explain_attribution(field_ctx: FieldContext, model: Any, explainer: Any = No
             "name": f"Soil Chemical Balance (pH {field_ctx.ph:.1f}, OC {field_ctx.soc*10:.1f} g/kg)",
             "direction": "LIMITING",
             "arrow": "🟡 ▼",
-            "impact_q_acre": "-1.2 q/acre",
+            "impact_q_acre": fmt(parts["soil_q_acre"]),
             "explanation": "Suboptimal carbon or pH mildly limits rhizosphere efficiency.",
             "provenance": "Govt Soil Health Card (DAC&FW Standards)"
         })
 
     # 3. Weather & Moisture (OpenWeather + MCII)
-    if field_ctx.temp_c > 35.0:
+    if parts["weather_q_acre"] < 0:
         factors.append({
             "name": f"Atmospheric Thermal Stress ({field_ctx.temp_c:.1f}°C)",
-            "direction": "STRESS BUFFERED",
-            "arrow": "🟢 ▲ (Mitigated)",
-            "impact_q_acre": "+1.5 q/acre (Yield Saved)",
-            "explanation": "Biostimulant buffers flower abortion under severe heat stress.",
+            "direction": "LIMITING",
+            "arrow": "🟡 ▼",
+            "impact_q_acre": fmt(parts["weather_q_acre"]),
+            "explanation": "This season's heat and rainfall pull yield below a typical season for this crop.",
             "provenance": "Live OpenWeather / MCII Station Telemetry"
         })
     else:
@@ -606,8 +693,8 @@ def explain_attribution(field_ctx: FieldContext, model: Any, explainer: Any = No
             "name": f"Climatic Temperature Window ({field_ctx.temp_c:.1f}°C)",
             "direction": "FAVORABLE",
             "arrow": "🟢 ▲",
-            "impact_q_acre": "+0.9 q/acre",
-            "explanation": "Favorable thermal regime supporting active vegetative growth.",
+            "impact_q_acre": fmt(parts["weather_q_acre"]),
+            "explanation": "This season's conditions are at or better than a typical season for this crop.",
             "provenance": "Live OpenWeather / Climatological Normals"
         })
 
