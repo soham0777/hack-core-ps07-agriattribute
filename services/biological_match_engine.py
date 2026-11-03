@@ -362,6 +362,7 @@ def render_biologicals_section_ui(
                 if st.button(f"🎯 Select {p.product_name.split()[0]} as Active Treatment", key=f"btn_sel_bio_{p.product_id}", use_container_width=True, type="primary" if idx == 0 else "secondary"):
                     st.session_state["selected_bio_product"] = p.product_name
                     st.session_state["s_dosage"] = p.application_rate_num
+                    st.session_state["s_dosage_unit"] = p.application_rate_unit
                     st.session_state["whatif_dosage"] = p.application_rate_num
                     st.session_state["_compute_key"] = None
                     st.toast(f"Selected {p.product_name} ({p.application_rate}) for Causal Attribution!", icon="🧬")
@@ -463,6 +464,7 @@ def render_biologicals_section_ui(
         if submit_app:
             st.session_state["selected_bio_product"] = log_prod
             st.session_state["s_dosage"] = log_dose
+            st.session_state["s_dosage_unit"] = matched_prod_obj.application_rate_unit
             st.session_state["whatif_dosage"] = log_dose
             st.session_state["_compute_key"] = None
             st.session_state["bio_logged_record"] = {
@@ -522,6 +524,7 @@ def _render_detailed_product_card(match_res: ProductMatchResult, lang: str, t: A
         if st.button(btn_label, key=f"btn_pick_bio_{abs(hash(p.product_name))}", type="primary" if is_selected else "secondary", use_container_width=True):
             st.session_state["selected_bio_product"] = p.product_name
             st.session_state["s_dosage"] = safe_float(p.application_rate_num, 1.0)
+            st.session_state["s_dosage_unit"] = p.application_rate_unit
             st.session_state["whatif_dosage"] = safe_float(p.application_rate_num, 1.0)
             st.session_state["_compute_key"] = None
             st.toast(f"Synchronized {p.product_name} across Yield, Cost, and ROI!", icon="🧬")

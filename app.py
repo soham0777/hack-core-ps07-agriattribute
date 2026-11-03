@@ -939,17 +939,11 @@ def main():
 
     # ── Real-Time Calibrated Farm State (Data Driven — No Synthetic Sliders) ──
     reg_shc = pricing_and_soil_engine.get_regional_soil_health_card(region)
-    shc_params = reg_shc.get("parameters", {})
-    nitrogen = safe_float(shc_params.get("Nitrogen (N)", {}).get("val", 140.0), 140.0)
-    phosphorus = safe_float(shc_params.get("Phosphorus (P)", {}).get("val", 16.4), 16.4)
-    potassium = safe_float(shc_params.get("Potassium (K)", {}).get("val", 300.0), 300.0)
-    soc = safe_float(shc_params.get("Organic Carbon (OC)", {}).get("val", 5.2), 5.2) / 10.0
-    ph = safe_float(shc_params.get("Soil pH", {}).get("val", 7.2), 7.2)
 
     curr_temp = safe_float(ow_live.get("temp_c", 28.5), 28.5)
     heat_stress = 6 if curr_temp > 35 else (4 if curr_temp > 32 else 2)
-    rainfall = 780.0
-    gdd = 2350.0
+    # Same season-rainfall assumption the yield model is fed (training climatology, no live rainfall feed yet)
+    rainfall = field_context.TRAINING_RAINFALL_NORMAL_MM.get(crop, 700.0)
     ndvi = 0.76
 
     bio_toggle = True
@@ -985,6 +979,7 @@ def main():
         round(safe_float(st.session_state.get('whatif_fert_ratio', 100.0), 100.0), 1),
         round(st.session_state.farm_lat, 4),
         round(st.session_state.farm_lon, 4),
+        st.session_state.get('s_dosage_unit', 'L/acre'),
     )
 
     if st.session_state.get('_compute_key') != _compute_key or 'field_ctx' not in st.session_state:
@@ -1001,7 +996,13 @@ def main():
             bio_applied=bio_toggle,
             bio_dosage=dosage,
             management_quality=st.session_state.get('whatif_mgt', 'Good'),
-            irrigation_type=st.session_state.get('whatif_irrig', 'Drip / Micro-irrigation')
+            irrigation_type=st.session_state.get('whatif_irrig', 'Drip / Micro-irrigation'),
+            # Per-acre product economics, so ROI follows the chosen dose and matches per-acre revenue
+            product_cost_per_ha=product_cost,
+            product_unit_cost_per_l=safe_float(algo_pricing.get("unit_rate_l", 850.0), 850.0),
+            application_cost_acre=safe_float(algo_pricing.get("labor_cost", 150.0), 150.0),
+            recommended_bio_dose=safe_float(algo_pricing.get("recommended_dosage_l_acre", 2.0), 2.0),
+            bio_dose_unit=st.session_state.get('s_dosage_unit', 'L/acre'),
         )
 
         # ── RUN UNIFIED INTELLIGENCE ENGINES OVER THE SINGLE FIELD STATE ──
@@ -1046,11 +1047,12 @@ def main():
     # 🔗 Synchronize Authoritative Yield & Price Attributes onto FieldContext
     field_ctx.predicted_yield_baseline = safe_float(pred_counterfactual, 24.0)
     field_ctx.biological_yield_lift = safe_float(yield_delta, 3.8)
-    field_ctx.treatment_cost = safe_float(product_cost, 1200.0)
+    field_ctx.treatment_cost = safe_float(curr_scen["biological_cost_inr"], product_cost)
     field_ctx.mandi_price = safe_float(crop_price, 5499.0)
-    unc_mae = safe_float(artifacts.get("metrics", {}).get("uncertainty_mae", 3.99), 3.99)
     pred_low = curr_scen["yield_lower_bound"]
     pred_high = curr_scen["yield_upper_bound"]
+    err_band = safe_float(curr_scen.get("error_band_q_acre", 3.99), 3.99)
+    yield_parts = scenario_sim["attribution"]
 
     # ══════════════════════════════════════════════════════════════════════
     # TASK-FIRST FARMER NAVIGATION ARCHITECTURE (100% Localized & Synchronized)
@@ -1735,7 +1737,7 @@ def main():
                     {pred_actual:.1f} <span style="font-size: 1.1rem; font-weight: 700; color: #64748b;">{t('yield_unit', lang)}</span>
                 </div>
                 <div style="font-size: 0.82rem; color: #64748b; margin-top: 2px;">
-                    Calibrated 90% Uncertainty Band: <strong>{pred_low:.1f} - {pred_high:.1f} {t('yield_unit', lang)}</strong> (±{unc_mae:.1f} q/ac MAE)
+                    90% Range (held-out error for this crop): <strong>{pred_low:.1f} - {pred_high:.1f} {t('yield_unit', lang)}</strong> (±{err_band:.1f} q/ac)
                 </div>
             </div>
             <div style="border-left: 2px solid #cbd5e1; padding-left: 18px;">
@@ -1752,25 +1754,23 @@ def main():
 
         st.markdown(why_html, unsafe_allow_html=True)
 
-        # Attribution Donut
+        # Attribution Waterfall: model-derived parts that add up to the prediction (can be negative)
         st.markdown("<br>", unsafe_allow_html=True)
         col_attr1, col_attr2 = st.columns(2)
         with col_attr1:
-            weather_weight = np.clip(0.36 + 0.04 * (rainfall/800.0) - 0.025*heat_stress, 0.15, 0.55)
-            soil_weight = np.clip(0.28 + 0.012 * soc + 0.015*(ph-6.5), 0.15, 0.45)
-            bio_weight = (yield_delta / pred_actual) if pred_actual > 0 else 0.12
-            baseline_weight = max(0.05, 1.0 - (weather_weight + soil_weight + bio_weight))
-            
             cat_bio = t("attr_bio", lang); cat_weather = t("attr_weather", lang); cat_soil = t("attr_soil", lang); cat_baseline = t("attr_baseline", lang)
-            categories = [cat_bio, cat_weather, cat_soil, cat_baseline]
-            values = [bio_weight*100, weather_weight*100, soil_weight*100, baseline_weight*100]
-            
-            fig_donut = px.pie(values=values, names=categories, hole=0.5, color=categories,
-                               color_discrete_map={cat_bio: "#059669", cat_weather: "#0284c7", cat_soil: "#d97706", cat_baseline: "#64748b"})
-            fig_donut.update_traces(textinfo='percent+label', marker=dict(line=dict(color='#ffffff', width=2)))
-            fig_donut.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', showlegend=False, margin=dict(l=20, r=20, t=20, b=20))
-            st.plotly_chart(fig_donut, use_container_width=True)
-            
+            fig_wf = go.Figure(go.Waterfall(
+                x=[cat_baseline, cat_soil, cat_weather, cat_bio, t('yield_unit', lang)],
+                measure=["absolute", "relative", "relative", "relative", "total"],
+                y=[yield_parts["base_q_acre"], yield_parts["soil_q_acre"], yield_parts["weather_q_acre"], yield_parts["bio_q_acre"], 0],
+                text=[f"{yield_parts['base_q_acre']:.1f}", f"{yield_parts['soil_q_acre']:+.2f}", f"{yield_parts['weather_q_acre']:+.2f}", f"{yield_parts['bio_q_acre']:+.2f}", f"{yield_parts['total_q_acre']:.1f}"],
+                textposition="outside",
+                increasing=dict(marker=dict(color="#059669")), decreasing=dict(marker=dict(color="#dc2626")), totals=dict(marker=dict(color="#0f172a")),
+            ))
+            fig_wf.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', showlegend=False, margin=dict(l=20, r=20, t=20, b=20), yaxis_title=t('yield_unit', lang))
+            st.plotly_chart(fig_wf, use_container_width=True)
+            st.caption(yield_parts.get("method", ""))
+
         with col_attr2:
             st.markdown(f"""
             <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 14px; padding: 18px;">
@@ -1779,13 +1779,13 @@ def main():
                     <span>🔬 <strong>{t('attr_bio', lang)}:</strong></span> <strong style="color:#059669;">+{yield_delta:.2f} {t('yield_unit', lang)}</strong>
                 </div>
                 <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e2e8f0;">
-                    <span>🌧️ <strong>{t('attr_weather', lang)}:</strong></span> <strong>{pred_actual * weather_weight:.1f} {t('yield_unit', lang)}</strong>
+                    <span>🌧️ <strong>{t('attr_weather', lang)}:</strong></span> <strong>{yield_parts['weather_q_acre']:+.2f} {t('yield_unit', lang)}</strong>
                 </div>
                 <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e2e8f0;">
-                    <span>🌱 <strong>{t('attr_soil', lang)}:</strong></span> <strong>{pred_actual * soil_weight:.1f} {t('yield_unit', lang)}</strong>
+                    <span>🌱 <strong>{t('attr_soil', lang)}:</strong></span> <strong>{yield_parts['soil_q_acre']:+.2f} {t('yield_unit', lang)}</strong>
                 </div>
                 <div style="display: flex; justify-content: space-between; padding: 8px 0;">
-                    <span>🚜 <strong>{t('attr_baseline', lang)}:</strong></span> <strong>{pred_actual * baseline_weight:.1f} {t('yield_unit', lang)}</strong>
+                    <span>🚜 <strong>{t('attr_baseline', lang)}:</strong></span> <strong>{yield_parts['base_q_acre']:.1f} {t('yield_unit', lang)}</strong>
                 </div>
             </div>
             """, unsafe_allow_html=True)

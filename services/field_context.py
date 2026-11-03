@@ -99,6 +99,24 @@ ENCODED_COLUMNS = [
     "region_Tamil Nadu & Cauvery Delta", "region_Telangana & Andhra (Krishna Basin)"
 ]
 
+# Biological rate each crop was trained at (pipeline CROPS_METRICS). Every treated trial of a crop used
+# this single rate, so the model cannot resolve dose-response: any other value is outside its training
+# data (Soybean at 3.0 is routed to Sugarcane leaves and jumps ~10x). The model always sees this rate;
+# the farmer's actual dose only drives cost.
+TRAINED_BIO_DOSE = {
+    "Chickpea (Gram / Chana)": 1.5, "Cotton": 1.5, "Groundnut (Peanut)": 1.5, "Maize": 2.0,
+    "Mustard / Rapeseed": 1.5, "Onion": 2.0, "Rice (Paddy)": 2.0, "Soybean": 2.0,
+    "Sugarcane": 3.0, "Tomato": 2.5, "Tur / Pigeon Pea (Arhar)": 2.0, "Wheat": 1.5,
+}
+
+# Mean season rainfall (mm) of each crop's training trials. Stands in for season-to-date rainfall until a
+# rainfall feed is wired in; the previous flat 780 mm put every Rabi crop (max ~460 mm) out of range.
+TRAINING_RAINFALL_NORMAL_MM = {
+    "Chickpea (Gram / Chana)": 170.0, "Cotton": 668.0, "Groundnut (Peanut)": 703.0, "Maize": 701.0,
+    "Mustard / Rapeseed": 165.0, "Onion": 169.0, "Rice (Paddy)": 672.0, "Soybean": 677.0,
+    "Sugarcane": 160.0, "Tomato": 164.0, "Tur / Pigeon Pea (Arhar)": 687.0, "Wheat": 172.0,
+}
+
 
 # Default Crop Stages
 DEFAULT_CROP_STAGES = {
@@ -209,9 +227,13 @@ class FieldContext:
     crop_price: float = 5499.0
     msp: float = 4892.0
     price_vs_msp_delta: float = 607.0
-    product_cost_per_ha: float = 1200.0
+    product_cost_per_ha: float = 1200.0  # legacy name: holds the per-acre default product + application cost
     fertilizer_cost_per_kg: float = 6.50
     market_source: str = "Agmarknet 2.0 Daily APMC Mandi Rates"
+    bio_dose_unit: str = "L/acre"
+    product_unit_cost_per_l: float = 850.0
+    application_cost_acre: float = 150.0
+    recommended_bio_dose: float = 2.0
 
     # 10. Model Inferred Yield Predictions & Economic Adapters (Synchronized)
     predicted_yield_baseline: Optional[float] = 24.0
@@ -243,6 +265,13 @@ class FieldContext:
             return 100
         return None
 
+    def product_cost_per_acre(self, dose: Optional[float] = None) -> float:
+        """Biological input cost in ₹/acre. Litre products scale with dose; others use the default pack cost."""
+        d = self.bio_dosage_l_ha if dose is None else dose
+        if str(self.bio_dose_unit).lower().startswith("l"):
+            return round(max(0.0, safe_float(d, 0.0)) * self.product_unit_cost_per_l + self.application_cost_acre, 0)
+        return self.product_cost_per_ha
+
     def to_feature_dataframe(
         self,
         bio_applied_override: Optional[bool] = None,
@@ -256,11 +285,12 @@ class FieldContext:
         """
         Transforms this field context into the exact 36-column DataFrame
         required by models/model.pkl and models/shap_explainer.pkl.
+
+        bio_dosage_override is accepted for compatibility but does not change the model input: a treated
+        field is always encoded at the crop's trained rate (see TRAINED_BIO_DOSE).
         """
         bio_app = self.bio_applied if bio_applied_override is None else bio_applied_override
-        bio_dos = self.bio_dosage_l_ha if bio_dosage_override is None else bio_dosage_override
-        if not bio_app:
-            bio_dos = 0.0
+        bio_dos = TRAINED_BIO_DOSE.get(self.proxy_crop, 2.0) if bio_app else 0.0
 
         n_val = self.nitrogen if nitrogen_override is None else nitrogen_override
         p_val = self.phosphorus if phosphorus_override is None else phosphorus_override
@@ -415,8 +445,9 @@ def build_field_context(
     is_live = (ow_live.get("status") == "LIVE")
 
     heat_stress_days = 6 if temp_c > 35 else (4 if temp_c > 32 else 2)
-    cum_rain = 780.0
-    gdd = 2350.0
+    cum_rain = TRAINING_RAINFALL_NORMAL_MM.get(proxy_crop, 700.0)
+    # Same temperature-to-GDD relation as the training data, so the two inputs stay consistent
+    gdd = round(min(2700.0, max(1200.0, temp_c * 65.0)), 1)
 
     # 4. MCII Hyperlocal Telemetry
     mcii_active = False
@@ -502,7 +533,7 @@ def build_field_context(
         crop_price=real_price,
         msp=msp,
         price_vs_msp_delta=delta,
-        product_cost_per_ha=1200.0,
+        product_cost_per_ha=kwargs.pop("product_cost_per_ha", 1200.0),
         fertilizer_cost_per_kg=6.50,
         market_source=str(source_status),
         **kwargs

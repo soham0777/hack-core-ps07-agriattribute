@@ -348,17 +348,20 @@ def run_pipeline():
     xgb_model.fit(X_train, y_train)
     xgb_preds = xgb_model.predict(X_test)
 
-    # 5-Fold GroupKFold Cross-Validation on Training Set
-    gkf = GroupKFold(n_splits=5)
-    cv_scores = []
-    for tr_idx, val_idx in gkf.split(X_train, y_train, groups=groups_train):
-        m_cv = xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.06, random_state=42)
-        m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
-        pred_cv = m_cv.predict(X_train.iloc[val_idx])
-        cv_scores.append(r2_score(y_train.iloc[val_idx], pred_cv))
+    # 5-Fold GroupKFold Cross-Validation on Training Set, run for every candidate so the selected
+    # model reports its own CV score (previously only XGBoost was cross-validated)
+    def grouped_cv(make_model):
+        scores = []
+        for tr_idx, val_idx in GroupKFold(n_splits=5).split(X_train, y_train, groups=groups_train):
+            m = make_model()
+            m.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+            scores.append(r2_score(y_train.iloc[val_idx], m.predict(X_train.iloc[val_idx])))
+        return float(np.mean(scores)), float(np.std(scores))
 
-    cv_mean = float(np.mean(cv_scores))
-    cv_std = float(np.std(cv_scores))
+    cv_mean, cv_std = grouped_cv(lambda: xgb.XGBRegressor(n_estimators=160, max_depth=5, learning_rate=0.06, subsample=0.85, colsample_bytree=0.85, random_state=42))
+    rf_cv_mean, rf_cv_std = grouped_cv(lambda: RandomForestRegressor(n_estimators=120, max_depth=9, min_samples_split=4, random_state=42, n_jobs=-1))
+    benchmarks["Random_Forest"]["grouped_cv_5fold_mean_r2"] = rf_cv_mean
+    benchmarks["Random_Forest"]["grouped_cv_5fold_std_r2"] = rf_cv_std
 
     benchmarks["XGBoost"] = {
         "model_name": "XGBoost Regressor (Tuned Production)",
@@ -379,8 +382,20 @@ def run_pipeline():
 
     # 5. Calibrated Prediction Uncertainty Estimation
     # Residual Standard Error on Test Set
-    residuals = y_test.values - (xgb_preds if best_key == "XGBoost" else rf_preds)
+    best_preds = xgb_preds if best_key == "XGBoost" else rf_preds
+    residuals = y_test.values - best_preds
     uncertainty_mae = float(np.mean(np.abs(residuals)))
+
+    # Pooled R2 is dominated by between-crop scale (8 vs 380 q/acre); report within-crop accuracy too
+    crop_test = df.loc[test_mask, "crop"].values
+    per_crop_metrics = {}
+    for c in np.unique(crop_test):
+        mask = crop_test == c
+        per_crop_metrics[c] = {
+            "n": int(mask.sum()),
+            "r2": round(float(r2_score(y_test.values[mask], best_preds[mask])), 3),
+            "mae": round(float(mean_absolute_error(y_test.values[mask], best_preds[mask])), 2),
+        }
     uncertainty_rmse = float(np.sqrt(np.mean(residuals ** 2)))
     ci_90_band = float(1.645 * uncertainty_rmse)
 
@@ -404,8 +419,9 @@ def run_pipeline():
             "rmse": round(best_metrics["rmse"], 2),
             "mae": round(best_metrics["mae"], 2),
             "mape": round(best_metrics["mape"], 4),
-            "cv_mean_r2": round(best_metrics.get("grouped_cv_5fold_mean_r2", best_metrics["r2"]), 4),
-            "cv_std_r2": round(best_metrics.get("grouped_cv_5fold_std_r2", 0.015), 4),
+            "cv_mean_r2": round(best_metrics["grouped_cv_5fold_mean_r2"], 4),
+            "cv_std_r2": round(best_metrics["grouped_cv_5fold_std_r2"], 4),
+            "per_crop_test": per_crop_metrics,
             "uncertainty_mae": round(uncertainty_mae, 2),
             "uncertainty_rmse": round(uncertainty_rmse, 2),
             "ci_90_band": round(ci_90_band, 2),
